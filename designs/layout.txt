@@ -1,0 +1,40 @@
+.
+├── cmd/
+│   ├── api/                  # REST API Server Entrypoint
+│   │   └── main.go
+│   └── sync-worker/          # Background worker for broker polling & token refresh
+│       └── main.go
+├── internal/
+│   ├── adapter/              # Outbound integrations (Broker Drivers)
+│   │   ├── broker.go         # Core BrokerAdapter interface
+│   │   ├── schwab/           # Schwab API Client & OAuth Implementation
+│   │   ├── ibkr/             # Interactive Brokers Web API Client
+│   │   └── tradier/          # Tradier API Client
+│   ├── domain/               # Core business models
+│   │   ├── account.go
+│   │   ├── position.go
+│   │   ├── strategy.go       # Multi-leg Options strategies logic
+│   │   └── trade.go
+│   ├── greeks/               # Black-Scholes & Greeks Engine
+│   │   └── evaluator.go
+│   ├── repository/           # PostgreSQL / TimescaleDB Data Access Layer
+│   │   ├── postgres.go
+│   │   ├── position_repo.go
+│   │   └── token_repo.go
+│   ├── service/              # Core Application Logic
+│   │   ├── auth_service.go
+│   │   ├── portfolio_service.go
+│   │   └── strategy_service.go
+│   └── transport/            # HTTP & WebSocket Inbound Handlers
+│       ├── http/
+│       │   ├── router.go
+│       │   ├── auth_handler.go
+│       │   └── portfolio_handler.go
+│       └── ws/
+│           └── hub.go        # Real-time WebSocket manager for UI updates
+├── pkg/
+│   ├── crypto/               # AES-256-GCM token encryption helpers
+│   └── logger/               # Structured logging (zap / zerolog)
+├── go.mod
+├── go.sum
+└── docker-compose.yml
