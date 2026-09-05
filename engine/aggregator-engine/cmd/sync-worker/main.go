@@ -22,12 +22,11 @@ import (
 	"aggregator-engine/internal/repository"
 )
 
-// SnapTradeAccount defines the structure needed to extract the real brokerage name
 type SnapTradeAccount struct {
 	ID                     string `json:"id"`
 	BrokerageAuthorization struct {
 		Brokerage struct {
-			Name string `json:"name"` // e.g., "Interactive Brokers", "Webull"
+			Name string `json:"name"`
 		} `json:"brokerage"`
 	} `json:"brokerage_authorization"`
 }
@@ -55,6 +54,7 @@ func main() {
 	plaidConfig.UseEnvironment(plaid.Sandbox)
 	plaidClient := plaid.NewAPIClient(plaidConfig)
 
+	// In production, this must be sourced from an environment variable (e.g., cfg.EncryptionKey)
 	testKey := []byte("0123456789abcdef0123456789abcdef")
 	encryptor, err := crypto.NewEncryptor(testKey)
 	if err != nil {
@@ -68,89 +68,125 @@ func main() {
 	txRepo := repository.NewPostgresTransactionRepo(db)
 
 	ctx := context.Background()
-	userID := "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
 
-	log.Info("Starting sync for user", slog.String("user_id", userID))
+	log.Info("Discovering active users for background sync...")
 
-	// ==========================================
-	// 1. PLAID SYNC (BASIC TIER)
-	// ==========================================
-	if items, err := plaidRepo.GetItemsForUser(ctx, userID); err == nil {
-		for _, item := range items {
-			pAdapter := plaidAdapter.NewPlaidAdapter(plaidClient, item.AccessToken)
+	// 1. Fetch all unique users who have at least one active brokerage connection
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT user_id FROM broker_accounts WHERE is_active = true`)
+	if err != nil {
+		log.Error("Failed to fetch active users from database", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
-			positions, err := pAdapter.FetchPositions(ctx, "")
-			if err != nil {
-				continue
+	var activeUsers []string
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err == nil {
+			activeUsers = append(activeUsers, uid)
+		}
+	}
+	// Safely close the rows to free the database connection pool before the heavy loop operations start
+	rows.Close()
+
+	// 2. Iterate through every active user and execute their specific sync pipelines
+	for _, userID := range activeUsers {
+		log.Info("Starting sync for user", slog.String("user_id", userID))
+
+		// ==========================================
+		// 1. PLAID SYNC (BASIC TIER)
+		// ==========================================
+		if items, err := plaidRepo.GetItemsForUser(ctx, userID); err == nil {
+			for _, item := range items {
+				pAdapter := plaidAdapter.NewPlaidAdapter(plaidClient, item.AccessToken)
+
+				positions, err := pAdapter.FetchPositions(ctx, "")
+				if err != nil {
+					log.Error("Failed to fetch Plaid positions", slog.String("error", err.Error()), slog.String("item_id", item.ItemID))
+					continue
+				}
+
+				positionsByAccount := make(map[string][]domain.Position)
+				for _, pos := range positions {
+					pos.UserID = userID
+					pos.Broker = domain.BrokerProvider("PLAID")
+					positionsByAccount[pos.AccountID] = append(positionsByAccount[pos.AccountID], pos)
+				}
+
+				for accID, accountPositions := range positionsByAccount {
+					_, err = db.ExecContext(ctx, `
+						INSERT INTO broker_accounts (user_id, broker, account_id, item_id, institution_name)
+						VALUES ($1, $2, $3, $4, $5)
+						ON CONFLICT (user_id, broker, account_id) DO UPDATE 
+						SET is_active = true, item_id = EXCLUDED.item_id, institution_name = EXCLUDED.institution_name;
+					`, userID, "PLAID", accID, item.ItemID, item.InstitutionName)
+					if err != nil {
+						log.Error("Failed to upsert plaid broker account", slog.String("error", err.Error()), slog.String("account_id", accID))
+						continue
+					}
+
+					_ = positionRepo.SyncAccountPositions(ctx, userID, accID, accountPositions)
+
+					startDateObj := getIncrementalStartDate(ctx, txRepo, userID)
+					endDateObj := time.Now()
+
+					if txs, err := pAdapter.FetchTransactions(ctx, accID, startDateObj, endDateObj); err == nil {
+						for i := range txs {
+							txs[i].UserID = userID
+							txs[i].Broker = "PLAID"
+						}
+						_ = txRepo.SyncTransactionWindow(ctx, userID, "PLAID", accID, startDateObj.Format("2006-01-02"), endDateObj.Format("2006-01-02"), txs)
+					}
+				}
 			}
+		}
 
-			positionsByAccount := make(map[string][]domain.Position)
-			for _, pos := range positions {
-				pos.UserID = userID
-				pos.Broker = domain.BrokerProvider("PLAID")
-				positionsByAccount[pos.AccountID] = append(positionsByAccount[pos.AccountID], pos)
-			}
+		// ==========================================
+		// 2. SNAPTRADE SYNC (PREMIUM TIER)
+		// ==========================================
+		if secret, err := snapTradeRepo.GetSecret(ctx, userID); err == nil && secret != "" {
+			stAdapter := snaptradeAdapter.NewSnapTradeAdapter(cfg.SnapTradeClientID, cfg.SnapTradeConsumerKey, userID, secret)
 
-			for accID, accountPositions := range positionsByAccount {
-				// FIXED: Includes item_id, institution_name, and revives is_active
+			accountList := discoverSnapTradeAccounts(cfg.SnapTradeClientID, cfg.SnapTradeConsumerKey, userID, secret)
+
+			for _, acc := range accountList {
+				instName := acc.BrokerageAuthorization.Brokerage.Name
+
 				_, err = db.ExecContext(ctx, `
-					INSERT INTO broker_accounts (user_id, broker, account_id, item_id, institution_name)
-					VALUES ($1, $2, $3, $4, $5)
+					INSERT INTO broker_accounts (user_id, broker, account_id, institution_name)
+					VALUES ($1, $2, $3, $4)
 					ON CONFLICT (user_id, broker, account_id) DO UPDATE 
-					SET is_active = true, item_id = EXCLUDED.item_id, institution_name = EXCLUDED.institution_name;
-				`, userID, "PLAID", accID, item.ItemID, item.InstitutionName)
+					SET is_active = true, institution_name = EXCLUDED.institution_name;
+				`, userID, "SNAPTRADE", acc.ID, instName)
+				if err != nil {
+					log.Error("Failed to upsert snaptrade broker account", slog.String("error", err.Error()), slog.String("account_id", acc.ID))
+					continue
+				}
 
-				_ = positionRepo.SyncAccountPositions(ctx, userID, accID, accountPositions)
+				if positions, err := stAdapter.FetchPositions(ctx, acc.ID); err == nil {
+					for i := range positions {
+						positions[i].UserID = userID
+						positions[i].Broker = domain.BrokerProvider("SNAPTRADE")
+					}
+					_ = positionRepo.SyncAccountPositions(ctx, userID, acc.ID, positions)
+				}
 
 				startDateObj := getIncrementalStartDate(ctx, txRepo, userID)
-				if txs, err := pAdapter.FetchTransactions(ctx, accID, startDateObj, time.Now()); err == nil && len(txs) > 0 {
+				endDateObj := time.Now()
+
+				if txs, err := stAdapter.FetchTransactions(ctx, acc.ID, startDateObj, endDateObj); err == nil {
 					for i := range txs {
 						txs[i].UserID = userID
+						txs[i].Broker = "SNAPTRADE"
 					}
-					_ = txRepo.UpsertTransactions(ctx, txs)
+					_ = txRepo.SyncTransactionWindow(ctx, userID, "SNAPTRADE", acc.ID, startDateObj.Format("2006-01-02"), endDateObj.Format("2006-01-02"), txs)
 				}
 			}
 		}
+
+		log.Info("Finished sync for user", slog.String("user_id", userID))
 	}
 
-	// ==========================================
-	// 2. SNAPTRADE SYNC (PREMIUM TIER)
-	// ==========================================
-	if secret, err := snapTradeRepo.GetSecret(ctx, userID); err == nil && secret != "" {
-		stAdapter := snaptradeAdapter.NewSnapTradeAdapter(cfg.SnapTradeClientID, cfg.SnapTradeConsumerKey, userID, secret)
-
-		accountList := discoverSnapTradeAccounts(cfg.SnapTradeClientID, cfg.SnapTradeConsumerKey, userID, secret)
-
-		for _, acc := range accountList {
-			instName := acc.BrokerageAuthorization.Brokerage.Name
-
-			// FIXED: Upserts institution_name and revives is_active (leaves item_id NULL)
-			_, err = db.ExecContext(ctx, `
-				INSERT INTO broker_accounts (user_id, broker, account_id, institution_name)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (user_id, broker, account_id) DO UPDATE 
-				SET is_active = true, institution_name = EXCLUDED.institution_name;
-			`, userID, "SNAPTRADE", acc.ID, instName)
-
-			if positions, err := stAdapter.FetchPositions(ctx, acc.ID); err == nil {
-				for i := range positions {
-					positions[i].UserID = userID
-					positions[i].Broker = domain.BrokerProvider("SNAPTRADE")
-				}
-				_ = positionRepo.SyncAccountPositions(ctx, userID, acc.ID, positions)
-			}
-
-			startDateObj := getIncrementalStartDate(ctx, txRepo, userID)
-			if txs, err := stAdapter.FetchTransactions(ctx, acc.ID, startDateObj, time.Now()); err == nil && len(txs) > 0 {
-				for i := range txs {
-					txs[i].UserID = userID
-				}
-				_ = txRepo.UpsertTransactions(ctx, txs)
-			}
-		}
-	}
-
-	log.Info("Sync Worker Finished Successfully.")
+	log.Info("Sync Worker Finished Successfully. Processed all active users.")
 }
 
 func getIncrementalStartDate(ctx context.Context, txRepo *repository.PostgresTransactionRepo, userID string) time.Time {
@@ -163,7 +199,6 @@ func getIncrementalStartDate(ctx context.Context, txRepo *repository.PostgresTra
 	return startDateObj
 }
 
-// FIXED: Now returns the structured array so the worker can extract the real institution name
 func discoverSnapTradeAccounts(clientID, consumerKey, userID, secret string) []SnapTradeAccount {
 	url := fmt.Sprintf("https://api.snaptrade.com/api/v1/accounts?clientId=%s&consumerKey=%s&userId=%s&userSecret=%s",
 		clientID, consumerKey, userID, secret)

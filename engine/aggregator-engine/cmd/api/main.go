@@ -10,14 +10,11 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/plaid/plaid-go/plaid"
 
-	"aggregator-engine/internal/adapter"
 	"aggregator-engine/internal/config"
 	"aggregator-engine/internal/middleware"
 	"aggregator-engine/internal/pkg/crypto"
 	"aggregator-engine/internal/pkg/logger"
 	"aggregator-engine/internal/repository"
-	"aggregator-engine/internal/service"
-	"aggregator-engine/internal/snaptrade"
 	httptransport "aggregator-engine/internal/transport/http"
 )
 
@@ -25,7 +22,6 @@ func main() {
 	// 1. Load and Validate Configuration First
 	cfg, err := config.Load()
 	if err != nil {
-		// We use standard log here because our structured logger hasn't initialized yet
 		slog.Error("Configuration failure", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
@@ -48,7 +44,7 @@ func main() {
 	}
 	log.Info("Successfully established PostgreSQL connection")
 
-	// 4. Initialize External API Clients (Plaid & SnapTrade)
+	// 4. Initialize External API Clients (Plaid)
 	plaidConfig := plaid.NewConfiguration()
 	plaidConfig.AddDefaultHeader("PLAID-CLIENT-ID", cfg.PlaidClientID)
 	plaidConfig.AddDefaultHeader("PLAID-SECRET", cfg.PlaidSecret)
@@ -64,13 +60,8 @@ func main() {
 	plaidClient := plaid.NewAPIClient(plaidConfig)
 	log.Info("Plaid client initialized", slog.String("plaid_env", cfg.PlaidEnv))
 
-	// New SnapTrade Client
-	snapClient := snaptrade.NewClient(cfg.SnapTradeClientID, cfg.SnapTradeConsumerKey)
-	log.Info("SnapTrade client initialized")
-
-	// 5. Initialize Repositories & Services
-
-	// Initialize the encryptor using the same 32-byte test key as the sync worker
+	// 5. Initialize Repositories
+	// Using the same 32-byte test key as the sync worker
 	testKey := []byte("0123456789abcdef0123456789abcdef")
 	encryptor, err := crypto.NewEncryptor(testKey)
 	if err != nil {
@@ -78,55 +69,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Inject the encryptor into our isolated token repositories
 	plaidRepo := repository.NewPostgresPlaidRepo(db, encryptor)
 	snapTradeRepo := repository.NewPostgresSnapTradeRepo(db, encryptor)
-
 	positionRepo := repository.NewPostgresPositionRepo(db)
 	txRepo := repository.NewPostgresTransactionRepo(db)
 	userRepo := repository.NewPostgresUserRepo(db)
 
-	factory := adapter.NewAdapterFactory()
-	portfolioService := service.NewPortfolioService(factory, positionRepo)
-
 	// 6. Initialize HTTP Handlers
-	portfolioHandler := httptransport.NewPortfolioHandler(portfolioService)
+	portfolioHandler := httptransport.NewPortfolioHandler(positionRepo, userRepo)
 	txHandler := httptransport.NewTransactionHandler(txRepo)
 	userHandler := httptransport.NewUserHandler(userRepo)
-
 	plaidHandler := httptransport.NewPlaidHandler(plaidClient, plaidRepo)
-	snapTradeHandler := httptransport.NewSnapTradeHandler(snapClient, snapTradeRepo)
+	snapTradeHandler := httptransport.NewSnapTradeHandler(cfg.SnapTradeClientID, cfg.SnapTradeConsumerKey, snapTradeRepo)
 
 	// 7. Setup Router & Auth Middleware
-	// We now pull the validated JWKS URL directly from our strict Config
-	authMiddleware := middleware.RequireAuth(cfg.SupabaseJWKSURL)
+	routerConfig := httptransport.RouterConfig{
+		AuthMiddleware:   middleware.RequireAuth(cfg.SupabaseJWKSURL),
+		PortfolioHandler: portfolioHandler,
+		TxHandler:        txHandler,
+		UserHandler:      userHandler,
+		PlaidHandler:     plaidHandler,
+		SnapTradeHandler: snapTradeHandler,
+	}
 
-	mux := http.NewServeMux()
-
-	// --- Public Routes ---
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status": "healthy"}`))
-	})
-	// Open route for new signups
-	mux.HandleFunc("POST /api/v1/users", userHandler.HandleCreateUser)
-
-	// --- Protected Routes ---
-
-	// Basic Tier Features (Inherited by Pro & Premium)
-	mux.Handle("GET /api/v1/portfolio", authMiddleware(middleware.RequireMinimumTier("basic")(http.HandlerFunc(portfolioHandler.HandleGetPortfolio))))
-	mux.Handle("GET /api/v1/transactions", authMiddleware(middleware.RequireMinimumTier("basic")(http.HandlerFunc(txHandler.HandleGetTransactions))))
-
-	mux.Handle("POST /api/v1/plaid/create-link-token", authMiddleware(middleware.RequireMinimumTier("basic")(http.HandlerFunc(plaidHandler.HandleCreateLinkToken))))
-	mux.Handle("POST /api/v1/plaid/exchange-public-token", authMiddleware(middleware.RequireMinimumTier("basic")(http.HandlerFunc(plaidHandler.HandleExchangePublicToken))))
-
-	// Premium Tier Features (Strictly Gated)
-	mux.Handle("POST /api/v1/snaptrade/link", authMiddleware(middleware.RequireMinimumTier("basic")(http.HandlerFunc(snapTradeHandler.HandleCreateLinkToken))))
+	mux := httptransport.SetupRouter(routerConfig)
 
 	// 8. Start Server
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
-		// Pass the dynamic origin from your config into the middleware
+		// Pass the dynamic origin from your config into the global CORS middleware
 		Handler:      middleware.CORS(cfg.FrontendOrigin)(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,

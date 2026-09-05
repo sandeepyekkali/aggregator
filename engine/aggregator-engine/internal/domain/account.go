@@ -31,3 +31,12 @@ type AccountBalance struct {
 	StockBuyingPower  float64        `json:"stock_buying_power"`
 	UpdatedAt         time.Time      `json:"updated_at"`
 }
+
+// ConnectionSummary represents an aggregated view of a user's connected institutions.
+// It groups multiple accounts (e.g., 2 checking, 1 savings) under a single institution.
+type ConnectionSummary struct {
+	Broker          string `json:"broker"`           // "PLAID" or "SNAPTRADE"
+	InstitutionName string `json:"institution_name"` // e.g., "Chase", "Interactive Brokers"
+	TotalAccounts   int    `json:"total_accounts"`   // Number of accounts under this institution
+	IsActive        bool   `json:"is_active"`        // False if token expired or ghost-buster failed
+}

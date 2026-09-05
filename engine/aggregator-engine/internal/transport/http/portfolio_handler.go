@@ -4,39 +4,69 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"aggregator-engine/internal/service"
+	"aggregator-engine/internal/pkg/logger"
+	"aggregator-engine/internal/repository"
 )
 
+// PortfolioHandler manages HTTP requests related to user holdings and brokerage connections.
 type PortfolioHandler struct {
-	portfolioService *service.PortfolioService
+	positionRepo *repository.PostgresPositionRepo
+	userRepo     *repository.PostgresUserRepo // Repo containing GetConnectionSummaries
 }
 
-func NewPortfolioHandler(svc *service.PortfolioService) *PortfolioHandler {
+func NewPortfolioHandler(positionRepo *repository.PostgresPositionRepo, userRepo *repository.PostgresUserRepo) *PortfolioHandler {
 	return &PortfolioHandler{
-		portfolioService: svc,
+		positionRepo: positionRepo,
+		userRepo:     userRepo,
 	}
 }
 
-// HandleGetPortfolio returns the aggregated portfolio for the authenticated user.
-func (h *PortfolioHandler) HandleGetPortfolio(w http.ResponseWriter, r *http.Request) {
-	// In a real application, userID comes from the JWT/Session context middleware.
-	// For testing, we are mocking it via a request header
-	userID, ok := r.Context().Value("user_id").(string)
+// GetPortfolio handles GET /api/v1/portfolio
+// It retrieves all synced positions for the authenticated user across all connected brokerages.
+func (h *PortfolioHandler) GetPortfolio(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Extract the user ID dynamically from the Auth middleware context
+	// NOTE: Update "user_id" if your middleware uses a custom typed key (e.g., middleware.UserIDKey)
+	userID, ok := ctx.Value("user_id").(string)
 	if !ok || userID == "" {
-		http.Error(w, "Unauthorized: missing user ID", http.StatusUnauthorized)
+		logger.Log.Error("Unauthorized request: missing user context in GetPortfolio")
+		http.Error(w, "Unauthorized: Invalid or missing user token", http.StatusUnauthorized)
 		return
 	}
 
-	// ... rest of your handler logic ...
-
-	positions, err := h.portfolioService.GetAggregatedPortfolio(r.Context(), userID)
+	positions, err := h.positionRepo.GetPositionsByUser(ctx, userID)
 	if err != nil {
-		http.Error(w, `{"error": "failed to fetch portfolio"}`, http.StatusInternalServerError)
+		logger.Log.Error("Failed to fetch portfolio positions", "error", err, "user_id", userID)
+		http.Error(w, "Failed to load portfolio", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(positions); err != nil {
-		http.Error(w, `{"error": "failed to encode response"}`, http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(positions)
+}
+
+// GetConnections handles GET /api/v1/connections
+// It returns a grouped summary of all active and inactive broker integrations for the Manage Connections UI.
+func (h *PortfolioHandler) GetConnections(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Extract the user ID dynamically from the Auth middleware context
+	userID, ok := ctx.Value("user_id").(string)
+	if !ok || userID == "" {
+		logger.Log.Error("Unauthorized request: missing user context in GetConnections")
+		http.Error(w, "Unauthorized: Invalid or missing user token", http.StatusUnauthorized)
+		return
 	}
+
+	// Fetch the aggregated connection summaries mapped from the broker_accounts table
+	connections, err := h.userRepo.GetConnectionSummaries(ctx, userID)
+	if err != nil {
+		logger.Log.Error("Failed to fetch connection summaries", "error", err, "user_id", userID)
+		http.Error(w, "Failed to load connections", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(connections)
 }

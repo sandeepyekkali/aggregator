@@ -1,0 +1,47 @@
+Tech Debt
+
+
+
+1. Data Integrity & Financial Edge Cases
+Gap: Missing Currency Normalization
+
+The Issue: The positions and transactions database schemas store market_value, cost_basis, price, and amount as raw numeric values, but there is no currency column. If a SnapTrade user connects a Canadian brokerage (CAD) and a US brokerage (USD), the backend will sum these values 1:1, resulting in wildly inaccurate portfolio totals.
+
+The Fix: Add a currency varchar(3) column to broker_accounts, positions, and transactions. The Go backend must either store everything in its native currency and let the frontend calculate exchange rates, or the backend must normalize everything to a base currency (e.g., USD) at the time of ingestion using a daily FX rate API.
+
+Gap: Corporate Actions (Splits & Mergers)
+
+The Issue: Your sync-worker does a strict "Ghost Buster" state reconciliation. If Apple does a 2-for-1 stock split, the broker updates the quantity from 100 to 200 overnight. Your worker will see 200 shares, update the database, and everything looks fine. However, your historical transactions will only show the original buy of 100 shares. When your analytics engine tries to calculate Time-Weighted Return (TWR) by summing historical trades, the math will fail because the 100 "split" shares have no corresponding buy transaction.
+
+The Fix: You need a Corporate Action service that listens for stock splits and retroactively adjusts the quantity and price of historical transactions in the database to match the post-split reality.
+
+2. Sync Worker Resiliency & Scaling
+Gap: Synchronous Loop & API Rate Limiting
+
+The Issue: sync-worker/main.go currently uses a single-threaded for loop to iterate through every user and every account. If you have 1,000 users with 3 accounts each, this worker will fire 3,000 sequential HTTP requests. This is not only incredibly slow, but it guarantees you will hit Plaid and SnapTrade 429 Too Many Requests rate limits, causing silent failures for users at the end of the loop.
+
+The Fix: The worker must be decoupled. Use a Redis-backed job queue (like Go's hibiken/asynq). A master cron job should enqueue a "SyncUser" task for each user. The worker pool can then process these concurrently with built-in retry logic, exponential backoff for 429s, and strict concurrency limits.
+
+Gap: Polling vs. Webhooks
+
+The Issue: Running the worker on a daily/hourly cron schedule means data is always stale. Premium options traders (SnapTrade tier) expect to see their trades appear in the UI seconds after execution.
+
+The Fix: Both Plaid and SnapTrade support Webhooks. The api/main.go router needs public webhook endpoints. When SnapTrade fires a TRADE_EXECUTED webhook, the backend should instantly enqueue a targeted sync job for that specific user, pull the new transaction, and push it to the React UI via the ws/hub.go WebSocket layer.
+
+3. Auth Lifecycle & User State
+Gap: The "Broken Link" State
+
+The Issue: Passwords change, MFA expires, and OAuth tokens get revoked. When this happens, Plaid and SnapTrade will return 401 Unauthorized or ITEM_LOGIN_REQUIRED. Currently, the sync-worker just logs an error and skips the account. The frontend user has no idea their data is stale; it just looks like they haven't made any trades recently.
+
+The Fix: Add a sync_status (e.g., OK, ERROR_CREDENTIALS, MAINTENANCE) and last_error_message column to broker_accounts. If the adapter hits a 401, it must update this status in the database. The PortfolioView.tsx component should read this status and display a warning banner: "Your connection to Chase has expired. [Click here to reconnect]."
+
+4. Database Optimization
+Gap: Missing Indexes on the Ledger
+
+The Issue: Your transactions table has a primary key on id, but the frontend and worker almost exclusively query by user_id and date (ORDER BY date DESC). As the transactions table grows to millions of rows, GET /api/v1/transactions will trigger full table scans, severely degrading API response times.
+
+The Fix: Apply composite indexes to your DDL immediately:
+
+SQL
+CREATE INDEX idx_transactions_user_date ON public.transactions(user_id, date DESC);
+CREATE INDEX idx_positions_user_account ON public.positions(user_id, account_id);

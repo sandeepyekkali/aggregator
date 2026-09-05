@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"aggregator-engine/internal/adapter"
@@ -83,14 +84,12 @@ func (a *PlaidAdapter) FetchAccountBalance(ctx context.Context, accountID string
 	}, nil
 }
 
-// FetchPositions satisfies the BrokerAdapter interface
 func (a *PlaidAdapter) FetchPositions(ctx context.Context, accountID string) ([]domain.Position, error) {
 	start := time.Now()
 	logger.Log.Info("Fetching Plaid holdings and positions", slog.String("account_id", accountID))
 
 	request := plaid.NewInvestmentsHoldingsGetRequest(a.accessToken)
 
-	// Only apply the filter if a specific accountID was requested
 	if accountID != "" {
 		request.SetOptions(plaid.InvestmentHoldingsGetRequestOptions{
 			AccountIds: &[]string{accountID},
@@ -134,7 +133,7 @@ func (a *PlaidAdapter) FetchPositions(ctx context.Context, accountID string) ([]
 
 		pos := domain.Position{
 			ID:           holding.GetSecurityId(),
-			AccountID:    holding.GetAccountId(), // CRITICAL: We keep Plaid's true sub-account ID here
+			AccountID:    holding.GetAccountId(),
 			Symbol:       ticker,
 			Quantity:     float64(holding.GetQuantity()),
 			CostBasis:    float64(holding.GetCostBasis()),
@@ -220,6 +219,7 @@ func (a *PlaidAdapter) FetchTransactions(ctx context.Context, accountID string, 
 				}
 			}
 
+			// Note: Plaid's /investments/transactions/get endpoint returns negative values for cash inflows (like stock sales) and positive values for outflows.
 			parsedTransactions = append(parsedTransactions, domain.Transaction{
 				ID:        t.GetInvestmentTransactionId(),
 				AccountID: t.GetAccountId(),
@@ -228,9 +228,10 @@ func (a *PlaidAdapter) FetchTransactions(ctx context.Context, accountID string, 
 				Name:      t.GetName(),
 				Quantity:  float64(t.GetQuantity()),
 				Price:     float64(t.GetPrice()),
-				Amount:    float64(t.GetAmount()),
-				Type:      t.GetType(),
-				// FIXED: InstitutionName completely removed
+				// Inverting Plaid's sign normalizes the value to standard accounting principles
+				Amount: -float64(t.GetAmount()),
+				// Normalize transaction types to uppercase to align with SnapTrade outputs
+				Type: strings.ToUpper(t.GetType()),
 			})
 		}
 

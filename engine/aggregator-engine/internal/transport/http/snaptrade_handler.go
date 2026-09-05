@@ -1,67 +1,115 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
-	"log/slog"
+	"fmt"
 	"net/http"
 
+	"aggregator-engine/internal/pkg/logger"
 	"aggregator-engine/internal/repository"
-	"aggregator-engine/internal/snaptrade"
 )
 
+// SnapTradeHandler manages HTTP requests related to Premium brokerage connections.
 type SnapTradeHandler struct {
-	client *snaptrade.Client
-	repo   repository.SnapTradeRepo // Using the isolated repository
+	clientID      string
+	consumerKey   string
+	snapTradeRepo *repository.PostgresSnapTradeRepo
 }
 
-func NewSnapTradeHandler(client *snaptrade.Client, repo repository.SnapTradeRepo) *SnapTradeHandler {
+func NewSnapTradeHandler(clientID, consumerKey string, repo *repository.PostgresSnapTradeRepo) *SnapTradeHandler {
 	return &SnapTradeHandler{
-		client: client,
-		repo:   repo,
+		clientID:      clientID,
+		consumerKey:   consumerKey,
+		snapTradeRepo: repo,
 	}
 }
 
-func (h *SnapTradeHandler) HandleCreateLinkToken(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value("user_id").(string)
+// GenerateLink handles GET /api/v1/snaptrade/link
+// It authenticates the user with SnapTrade and returns the secure Connection Portal URL.
+func (h *SnapTradeHandler) GenerateLink(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Extract the user ID dynamically from the Auth middleware context
+	// NOTE: If your internal/middleware/auth.go uses a custom type (e.g., middleware.UserIDKey),
+	// update "user_id" to match that exact context key.
+	userID, ok := ctx.Value("user_id").(string)
 	if !ok || userID == "" {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		logger.Log.Error("Unauthorized request: missing user context in GenerateLink")
+		http.Error(w, "Unauthorized: Invalid or missing user token", http.StatusUnauthorized)
 		return
 	}
 
-	// 1. Check our isolated table for an existing secret
-	secret, err := h.repo.GetSecret(r.Context(), userID)
-	if err != nil {
-		slog.Error("Failed to fetch SnapTrade secret from DB", slog.String("error", err.Error()))
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// 2. If missing, register and encrypt/save
-	if secret == "" {
-		secret, err = h.client.RegisterUser(r.Context(), userID)
+	// Fetch the user's SnapTrade secret from the database
+	secret, err := h.snapTradeRepo.GetSecret(ctx, userID)
+	if err != nil || secret == "" {
+		// If the user doesn't have a secret, they are new to the Premium tier.
+		// We must register them with SnapTrade first to generate a userSecret.
+		secret, err = h.registerSnapTradeUser(userID)
 		if err != nil {
-			slog.Error("SnapTrade registration failed", slog.String("error", err.Error()))
-			http.Error(w, "Failed to register broker account", http.StatusBadGateway)
+			logger.Log.Error("Failed to register new SnapTrade user", "error", err, "user_id", userID)
+			http.Error(w, "Failed to initialize premium account", http.StatusInternalServerError)
 			return
 		}
 
-		if err := h.repo.SetSecret(r.Context(), userID, secret); err != nil {
-			slog.Error("Failed to save encrypted SnapTrade secret", slog.String("error", err.Error()))
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+		// Save the newly generated secret to the snaptrade_users table
+		_ = h.snapTradeRepo.SaveSecret(ctx, userID, secret)
 	}
 
-	// 3. Generate the UI login link
-	redirectURI, err := h.client.GenerateLoginLink(r.Context(), userID, secret)
-	if err != nil {
-		slog.Error("SnapTrade link generation failed", slog.String("error", err.Error()))
-		http.Error(w, "Failed to generate link", http.StatusBadGateway)
+	// Request the Connection Portal URL from SnapTrade
+	loginURL := fmt.Sprintf("https://api.snaptrade.com/api/v1/authentication/login?clientId=%s&consumerKey=%s", h.clientID, h.consumerKey)
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"userId":     userID,
+		"userSecret": secret,
+	})
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", loginURL, bytes.NewBuffer(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode != 200 {
+		logger.Log.Error("Failed to generate SnapTrade portal link", "status", res.StatusCode, "user_id", userID)
+		http.Error(w, "Failed to generate connection link", http.StatusBadGateway)
+		return
+	}
+	defer res.Body.Close()
+
+	// Parse the redirect URI and return it to the React frontend
+	var loginResp struct {
+		RedirectURI string `json:"redirectURI"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&loginResp); err != nil {
+		http.Error(w, "Invalid response from broker gateway", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"redirect_uri": redirectURI,
+		"redirect_uri": loginResp.RedirectURI,
 	})
+}
+
+// registerSnapTradeUser calls the SnapTrade API to provision a new user and returns their secret.
+func (h *SnapTradeHandler) registerSnapTradeUser(userID string) (string, error) {
+	url := fmt.Sprintf("https://api.snaptrade.com/api/v1/snapTrade/registerUser?clientId=%s&consumerKey=%s", h.clientID, h.consumerKey)
+
+	reqBody, _ := json.Marshal(map[string]string{"userId": userID})
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode != 200 {
+		return "", fmt.Errorf("registration request failed with status: %d", res.StatusCode)
+	}
+	defer res.Body.Close()
+
+	var regResp struct {
+		UserSecret string `json:"userSecret"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&regResp); err != nil {
+		return "", fmt.Errorf("failed to decode registration response")
+	}
+
+	return regResp.UserSecret, nil
 }
